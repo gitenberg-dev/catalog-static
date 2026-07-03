@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Browse the GITenberg catalog</title>
+<link rel="icon" href="assets/favicon.ico">
+<link rel="stylesheet" href="assets/style.css">
+
+</head>
+<body>
+<header class="site">
+  <a class="brand" href="index.html"><img src="assets/Gitenberg_full.svg" alt="GITenberg"></a>
+  <nav><a class="" href="index.html">Home</a><a class="on" href="books.html">Books</a><a class="" href="faq.html">FAQ</a><a class="" href="get-involved.html">Get Involved</a><a class="" href="license.html">License</a></nav>
+</header>
+<main>
+<h1 style="text-align:center">Browse 43,248 books</h1>
+<div class="searchbar">
+  <div class="searchrow">
+    <input id="q" type="search" placeholder="Search by title, author keyword, or Gutenberg id…" autocomplete="off" autofocus>
+    <select id="lang"><option value="">All languages</option><option value="en">en</option><option value="fr">fr</option><option value="de">de</option><option value="fi">fi</option><option value="nl">nl</option><option value="pt">pt</option><option value="it">it</option><option value="zh">zh</option><option value="es">es</option><option value="el">el</option><option value="hu">hu</option><option value="eo">eo</option></select>
+  </div>
+</div>
+<div class="count" id="count">Loading the catalog…</div>
+<ol class="results" id="results"></ol>
+<div class="loading" id="more"></div>
+
+<script>
+const LIMIT = 100;
+let BOOKS = [], view = [];
+const $q = document.getElementById('q'), $lang = document.getElementById('lang'),
+      $res = document.getElementById('results'), $count = document.getElementById('count'),
+      $more = document.getElementById('more');
+function fmt(n){return n.toLocaleString();}
+function esc(s){return s.replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
+function render(){
+  const rows = view.slice(0, LIMIT).map((b,i)=>{
+    const [id,repo,title,lang,dl] = b;
+    const gh = 'https://github.com/GITenberg/'+encodeURIComponent(repo);
+    const pg = 'https://www.gutenberg.org/ebooks/'+id;
+    return '<li><span class="rank">'+(i+1)+'</span><div class="bk">'+
+      '<div class="t"><a href="'+gh+'">'+esc(title)+'</a></div>'+
+      '<div class="m"><span class="badge">'+esc(lang)+'</span>'+
+      '<span class="dl">'+fmt(dl)+' downloads</span>'+
+      '<a href="'+gh+'">GitHub repo</a><a href="'+pg+'">Project Gutenberg</a>'+
+      '<span style="color:#b3b6b3">#'+id+'</span></div></div></li>';
+  }).join('');
+  $res.innerHTML = rows;
+  $count.textContent = fmt(view.length) + ' book' + (view.length===1?'':'s') +
+    (view.length>LIMIT ? ' — showing the top '+LIMIT+' by downloads' : '');
+  $more.textContent = view.length>LIMIT ? 'Refine your search to see more.' : '';
+}
+function apply(){
+  const q = $q.value.trim().toLowerCase(), lang = $lang.value;
+  const numeric = /^\d+$/.test(q);
+  view = BOOKS.filter(b=>{
+    if(lang && b[3]!==lang) return false;
+    if(!q) return true;
+    if(numeric && String(b[0])===q) return true;
+    return b[2].toLowerCase().includes(q);
+  });
+  render();
+}
+let t; function debounced(){clearTimeout(t);t=setTimeout(apply,110);}
+$q.addEventListener('input',debounced); $lang.addEventListener('change',apply);
+fetch('data/books.json').then(r=>r.json()).then(d=>{BOOKS=d;view=d;render();})
+  .catch(e=>{$count.textContent='Failed to load catalog: '+e;});
+</script>
+
+</main>
+<footer class="site">
+  <p>A static archive of the GITenberg catalog &middot; generated from GITenberg metadata &middot;
+     books are in the public domain, <a href="license.html">free for any use</a>.</p>
+</footer>
+</body>
+</html>
