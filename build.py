@@ -74,8 +74,11 @@ def load_books():
 
     Download counts are omitted deliberately: the DB never stored them; the 2015 TSV
     'downloads' column was a one-off snapshot, a decade stale."""
-    tsv_lang = {gid: lang for gid, (lang, _dl) in load_tsv_enrichment().items()}
+    tsv = load_tsv_enrichment()  # gid -> (lang, downloads); a 2015 snapshot, ~43k books
+    tsv_lang = {g: l for g, (l, _d) in tsv.items()}
+    tsv_dl = {g: d for g, (_l, d) in tsv.items()}
     seen = {}
+    # record: [gid, repo, title, lang, author, downloads]  (downloads 0 = unknown)
     if os.path.exists(HARVEST_CSV):
         authors = _authors_from_http()
         with open(HARVEST_CSV, newline="", encoding="utf-8") as f:
@@ -86,7 +89,7 @@ def load_books():
                     continue
                 lang = (row.get("language") or "").strip() or tsv_lang.get(gid) or "und"
                 seen[gid] = [gid, (row.get("repo_name") or "").strip(), title, lang,
-                             authors.get(gid, "")]
+                             authors.get(gid, ""), tsv_dl.get(gid, 0)]
     else:
         # HTTP fallback: page-walk first, probe second so probe (has language) wins
         for d in list(_read_jsonl(HARVEST_WALK)) + list(_read_jsonl(HARVEST_PROBE)):
@@ -96,21 +99,24 @@ def load_books():
                 continue
             author = re.sub(r"\s+", " ", (d.get("author") or "").strip())
             lang = (d.get("language") or "").strip() or tsv_lang.get(gid) or "und"
-            seen[gid] = [gid, (d.get("repo") or "").strip(), title, lang, author]
+            seen[gid] = [gid, (d.get("repo") or "").strip(), title, lang, author, tsv_dl.get(gid, 0)]
     books = sorted(seen.values(), key=lambda b: b[2].lower())
     return books
 
 def stats(books):
     langs = {}
     authors = set()
-    for _, _, _, lang, author in books:
+    with_dl = 0
+    for _, _, _, lang, author, dl in books:
         if lang != "und":
             langs[lang] = langs.get(lang, 0) + 1
         if author:
             authors.add(author)
+        if dl:
+            with_dl += 1
     top_langs = sorted(langs.items(), key=lambda kv: -kv[1])
     return {"count": len(books), "languages": len(langs),
-            "authors": len(authors), "top_langs": top_langs}
+            "authors": len(authors), "with_dl": with_dl, "top_langs": top_langs}
 
 # ---------- shared chrome ----------
 def page(title, active, body, extra_head=""):
@@ -247,6 +253,10 @@ def books_page(st):
 <div class="searchbar">
   <div class="searchrow">
     <input id="q" type="search" placeholder="Search by title, author keyword, or Gutenberg id…" autocomplete="off" autofocus>
+    <select id="sort">
+      <option value="title">Sort: Title (A–Z)</option>
+      <option value="downloads">Sort: Most downloaded</option>
+    </select>
     <select id="lang">%%OPTS%%</select>
   </div>
 </div>
@@ -259,26 +269,37 @@ def books_page(st):
 const LIMIT = 100;
 let BOOKS = [], view = [];
 const $q = document.getElementById('q'), $lang = document.getElementById('lang'),
+      $sort = document.getElementById('sort'),
       $res = document.getElementById('results'), $count = document.getElementById('count'),
       $more = document.getElementById('more');
 function fmt(n){return n.toLocaleString();}
 function esc(s){return s.replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
 function render(){
+  const byDl = $sort.value==='downloads';
   const rows = view.slice(0, LIMIT).map((b,i)=>{
-    const [id,repo,title,lang,author] = b;
+    const [id,repo,title,lang,author,dl] = b;
     const gh = 'https://github.com/GITenberg/'+encodeURIComponent(repo);
     const pg = 'https://www.gutenberg.org/ebooks/'+id;
     return '<li><span class="rank">'+(i+1)+'</span><div class="bk">'+
       '<div class="t"><a href="'+gh+'">'+esc(title)+'</a></div>'+
       '<div class="m">'+(author?'<span>'+esc(author)+'</span>':'')+
       (lang && lang!=='und' ? '<span class="badge">'+esc(lang)+'</span>' : '')+
+      (dl ? '<span class="dl" title="Project Gutenberg downloads, 2015 snapshot">'+fmt(dl)+' downloads (2015)</span>' : '')+
       '<a href="'+gh+'">GitHub repo</a><a href="'+pg+'">Project Gutenberg</a>'+
       '<span style="color:#b3b6b3">#'+id+'</span></div></div></li>';
   }).join('');
   $res.innerHTML = rows;
-  $count.textContent = fmt(view.length) + ' book' + (view.length===1?'':'s') +
-    (view.length>LIMIT ? ' — showing the first '+LIMIT : '');
-  $more.textContent = view.length>LIMIT ? 'Refine your search to see more.' : '';
+  let note = view.length>LIMIT ? ' — showing the first '+LIMIT : '';
+  $count.textContent = fmt(view.length) + ' book' + (view.length===1?'':'s') + note;
+  $more.innerHTML = byDl
+    ? 'Ranked by Project Gutenberg download counts from a 2015 snapshot (available for ~'+fmt(DL_COUNT)+' books; the rest sort after, alphabetically).'
+    : (view.length>LIMIT ? 'Refine your search to see more.' : '');
+}
+function sortView(){
+  if($sort.value==='downloads')
+    view.sort((a,b)=> (b[5]-a[5]) || a[2].toLowerCase().localeCompare(b[2].toLowerCase()));
+  else
+    view.sort((a,b)=> a[2].toLowerCase().localeCompare(b[2].toLowerCase()));
 }
 function apply(){
   const q = $q.value.trim().toLowerCase(), lang = $lang.value;
@@ -289,12 +310,16 @@ function apply(){
     if(numeric && String(b[0])===q) return true;
     return b[2].toLowerCase().includes(q) || (b[4] && b[4].toLowerCase().includes(q));
   });
+  sortView();
   render();
 }
+let DL_COUNT = 0;
 let t; function debounced(){clearTimeout(t);t=setTimeout(apply,110);}
 $q.addEventListener('input',debounced); $lang.addEventListener('change',apply);
-fetch('data/books.json').then(r=>r.json()).then(d=>{BOOKS=d;view=d;render();})
-  .catch(e=>{$count.textContent='Failed to load catalog: '+e;});
+$sort.addEventListener('change',apply);
+fetch('data/books.json').then(r=>r.json()).then(d=>{
+  BOOKS=d; DL_COUNT=d.filter(b=>b[5]>0).length; view=d.slice(); sortView(); render();
+}).catch(e=>{$count.textContent='Failed to load catalog: '+e;});
 </script>
 """
     return page("Browse the GITenberg catalog", "books.html", body, extra_head="") \
