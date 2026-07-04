@@ -22,38 +22,95 @@ DATA = os.path.join(SITE, "data")
 
 csv.field_size_limit(10_000_000)
 
-def load_books():
-    seen = {}
+HARVEST_WALK = os.path.join(HERE, "harvest", "books_db.jsonl")     # page-walk (title, author)
+HARVEST_PROBE = os.path.join(HERE, "harvest", "books_probe.jsonl")  # /books/<id>.json (title, author, language)
+
+def load_tsv_enrichment():
+    """language + downloads from the old repo TSV snapshot (subset of books)."""
+    enrich = {}
+    if not os.path.exists(TSV):
+        return enrich
     with open(TSV, newline="", encoding="utf-8", errors="replace") as f:
         r = csv.reader(f, delimiter="\t")
-        header = next(r, None)
+        next(r, None)
         for row in r:
-            if len(row) < 6:
+            if len(row) < 6 or not row[1].strip().isdigit():
                 continue
-            gid, repo, title, lang, dl = row[1], row[2], row[3], row[4], row[5]
-            if not gid.strip().isdigit():
-                continue
-            gid = int(gid)
-            title = re.sub(r"\s+", " ", (title or "").strip())
+            gid = int(row[1])
+            lang = (row[4] or "").strip() or "und"
+            dl = int(row[5]) if row[5].strip().isdigit() else 0
+            if gid not in enrich or dl > enrich[gid][1]:
+                enrich[gid] = (lang, dl)
+    return enrich
+
+def _read_jsonl(path):
+    if not os.path.exists(path):
+        return
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                yield json.loads(line)
+
+HARVEST_CSV = os.path.join(HERE, "harvest", "books_db.csv")  # authoritative direct DB dump
+
+def _authors_from_http():
+    """gid -> author, gleaned from the HTTP harvests (the DB Book table has no
+    author column; author lives in the per-book metadata the JSON endpoint exposes)."""
+    a = {}
+    for d in list(_read_jsonl(HARVEST_WALK)) + list(_read_jsonl(HARVEST_PROBE)):
+        au = re.sub(r"\s+", " ", (d.get("author") or "").strip())
+        if au:
+            a[int(d["gid"])] = au
+    return a
+
+def load_books():
+    """Book catalog snapshot (2026-07-03) from the retiring EB app's database.
+
+    Preferred source: harvest/books_db.csv — a direct `SELECT ... FROM bookinfo_book`
+    dump (authoritative, complete, exact). Author is backfilled from the HTTP harvest
+    where available (no author column in the DB table). If the CSV is absent, fall
+    back to the two HTTP harvests merged/deduped by Gutenberg id.
+
+    Download counts are omitted deliberately: the DB never stored them; the 2015 TSV
+    'downloads' column was a one-off snapshot, a decade stale."""
+    tsv_lang = {gid: lang for gid, (lang, _dl) in load_tsv_enrichment().items()}
+    seen = {}
+    if os.path.exists(HARVEST_CSV):
+        authors = _authors_from_http()
+        with open(HARVEST_CSV, newline="", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                gid = int(row["book_id"])
+                title = re.sub(r"\s+", " ", (row.get("title") or "").strip())
+                if not title:
+                    continue
+                lang = (row.get("language") or "").strip() or tsv_lang.get(gid) or "und"
+                seen[gid] = [gid, (row.get("repo_name") or "").strip(), title, lang,
+                             authors.get(gid, "")]
+    else:
+        # HTTP fallback: page-walk first, probe second so probe (has language) wins
+        for d in list(_read_jsonl(HARVEST_WALK)) + list(_read_jsonl(HARVEST_PROBE)):
+            gid = int(d["gid"])
+            title = re.sub(r"\s+", " ", (d.get("title") or "").strip())
             if not title:
                 continue
-            lang = (lang or "").strip() or "und"
-            downloads = int(dl) if dl.strip().isdigit() else 0
-            # dedup by Gutenberg id, keep the higher-download record
-            if gid not in seen or downloads > seen[gid][4]:
-                seen[gid] = [gid, repo.strip(), title, lang, downloads]
-    books = sorted(seen.values(), key=lambda b: (-b[4], b[2].lower()))
+            author = re.sub(r"\s+", " ", (d.get("author") or "").strip())
+            lang = (d.get("language") or "").strip() or tsv_lang.get(gid) or "und"
+            seen[gid] = [gid, (d.get("repo") or "").strip(), title, lang, author]
+    books = sorted(seen.values(), key=lambda b: b[2].lower())
     return books
 
 def stats(books):
     langs = {}
-    total_dl = 0
-    for _, _, _, lang, dl in books:
-        langs[lang] = langs.get(lang, 0) + 1
-        total_dl += dl
+    authors = set()
+    for _, _, _, lang, author in books:
+        if lang != "und":
+            langs[lang] = langs.get(lang, 0) + 1
+        if author:
+            authors.add(author)
     top_langs = sorted(langs.items(), key=lambda kv: -kv[1])
     return {"count": len(books), "languages": len(langs),
-            "downloads": total_dl, "top_langs": top_langs}
+            "authors": len(authors), "top_langs": top_langs}
 
 # ---------- shared chrome ----------
 def page(title, active, body, extra_head=""):
@@ -86,8 +143,9 @@ TPL = """<!doctype html>
 </header>
 <main>%%BODY%%</main>
 <footer class="site">
-  <p>A static archive of the GITenberg catalog &middot; generated from GITenberg metadata &middot;
-     books are in the public domain, <a href="license.html">free for any use</a>.</p>
+  <p>A static archive of the GITenberg catalog &middot; July 2026 snapshot of the
+     GITenberg catalog database &middot; books are in the public domain,
+     <a href="license.html">free for any use</a>.</p>
 </footer>
 </body>
 </html>
@@ -162,8 +220,8 @@ def home(st):
   <a class="btn" href="books.html">Browse the catalog &rarr;</a>
   <div class="stats">
     <div class="stat"><div class="n">%%BOOKS%%</div><div class="l">Books</div></div>
+    <div class="stat"><div class="n">%%AUTHORS%%</div><div class="l">Authors</div></div>
     <div class="stat"><div class="n">%%LANGS%%</div><div class="l">Languages</div></div>
-    <div class="stat"><div class="n">%%DL%%</div><div class="l">Recorded downloads</div></div>
   </div>
 </section>
 <section class="prose">
@@ -176,8 +234,8 @@ def home(st):
      on any static host and regenerated any time from the GITenberg metadata.</p>
 </section>
 """.replace("%%BOOKS%%", fmt(st["count"])) \
-   .replace("%%LANGS%%", fmt(st["languages"])) \
-   .replace("%%DL%%", fmt(st["downloads"]))
+   .replace("%%AUTHORS%%", fmt(st["authors"])) \
+   .replace("%%LANGS%%", fmt(st["languages"]))
     return page("GITenberg — public-domain ebooks on GitHub", "index.html", body)
 
 def books_page(st):
@@ -207,19 +265,19 @@ function fmt(n){return n.toLocaleString();}
 function esc(s){return s.replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
 function render(){
   const rows = view.slice(0, LIMIT).map((b,i)=>{
-    const [id,repo,title,lang,dl] = b;
+    const [id,repo,title,lang,author] = b;
     const gh = 'https://github.com/GITenberg/'+encodeURIComponent(repo);
     const pg = 'https://www.gutenberg.org/ebooks/'+id;
     return '<li><span class="rank">'+(i+1)+'</span><div class="bk">'+
       '<div class="t"><a href="'+gh+'">'+esc(title)+'</a></div>'+
-      '<div class="m"><span class="badge">'+esc(lang)+'</span>'+
-      '<span class="dl">'+fmt(dl)+' downloads</span>'+
+      '<div class="m">'+(author?'<span>'+esc(author)+'</span>':'')+
+      (lang && lang!=='und' ? '<span class="badge">'+esc(lang)+'</span>' : '')+
       '<a href="'+gh+'">GitHub repo</a><a href="'+pg+'">Project Gutenberg</a>'+
       '<span style="color:#b3b6b3">#'+id+'</span></div></div></li>';
   }).join('');
   $res.innerHTML = rows;
   $count.textContent = fmt(view.length) + ' book' + (view.length===1?'':'s') +
-    (view.length>LIMIT ? ' — showing the top '+LIMIT+' by downloads' : '');
+    (view.length>LIMIT ? ' — showing the first '+LIMIT : '');
   $more.textContent = view.length>LIMIT ? 'Refine your search to see more.' : '';
 }
 function apply(){
@@ -229,7 +287,7 @@ function apply(){
     if(lang && b[3]!==lang) return false;
     if(!q) return true;
     if(numeric && String(b[0])===q) return true;
-    return b[2].toLowerCase().includes(q);
+    return b[2].toLowerCase().includes(q) || (b[4] && b[4].toLowerCase().includes(q));
   });
   render();
 }
@@ -337,8 +395,8 @@ def main():
             f.write(content)
     size = os.path.getsize(os.path.join(DATA, "books.json"))
     print("Books:      {:,}".format(st["count"]))
+    print("Authors:    {:,}".format(st["authors"]))
     print("Languages:  {:,}".format(st["languages"]))
-    print("Downloads:  {:,}".format(st["downloads"]))
     print("books.json: {:.1f} MB".format(size / 1e6))
     print("Top langs:  " + ", ".join("{}={}".format(l, n) for l, n in st["top_langs"][:6]))
     print("Output ->   " + SITE)
